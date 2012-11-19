@@ -35,7 +35,7 @@ module Tablegen
 
     ignore " \t"
 
-    literals "<>{};=,:[]-().?"
+    literals "<>{};=,:[]-().?#"
 
     token(/\n+/) do |t|
       t.lexer.lineno += t.value.length
@@ -112,6 +112,7 @@ module Tablegen
         @filename = fn
         @input = open(fn).read
         @pos = 0
+        puts "PUSH <- #{fn}"
       rescue Errno::ENOENT
         unless search_paths.empty?
           p = search_paths.shift
@@ -126,8 +127,8 @@ module Tablegen
     end
 
     def pop_file
-      fn = @filename
       (@input, @pos, @filename, @lineno) = @inputstack.pop
+      puts "POP -> #{@filename}"
     end
 
     def search_paths
@@ -143,7 +144,7 @@ module Tablegen
     end
 
     rule 'definitions : definition
-                      | definition definitions' do |defs, df, _, other_defs|
+                      | definition definitions' do |defs, df, other_defs|
       defs.value = [df.value]
       defs.value += other_defs.value if other_defs
     end
@@ -249,12 +250,13 @@ module Tablegen
       f.value = va.value
     end
 
-    rule 'multiclassdef : MULTICLASS ID maybe_classdefargs "{" definitions "}"' do |cdef, _, name, args, _, defs, _|
+    rule 'multiclassdef : MULTICLASS ID maybe_classdefargs maybe_superclasses "{" definitions "}"' do |cdef, _, name, args, sup, _, defs, _|
       cdef.value = {
         kind: :multiclass,
         name: name.value,
         args: args.value,
         defs: defs.value,
+        superclass: sup.value,
         def_at: name.location_info,
       }
     end
@@ -315,12 +317,12 @@ module Tablegen
     end
 
     # mdefs
-    rule 'defmdef : DEFM ID maybe_superclasses ";"' do |df, _, name, cname, _|
+    rule 'defmdef : DEFM maybe_id maybe_superclasses ";"' do |df, td, name, cname, _|
       df.value = {
         kind: :defm,
         name: name.value,
         classname: cname.value,
-        def_at: name.location_info,
+        def_at: td.location_info,
       }
     end
 
@@ -338,20 +340,10 @@ module Tablegen
       }
     end
 
-    rule 'defdef : DEF maybe_id maybe_superclasses "<" values ">" ";"
-                 | DEF maybe_id maybe_superclasses "<" values ">" "," values ";"' do |df, td, name, cname, _, vals, _, _, randomval, _|
-      df.value = {
-        kind: :def,
-        name: name.value,
-        vals: vals.value,
-        classname: cname.value,
-        def_at: td.location_info,
-      }
-      df.value[:randomval] = randomval.value if randomval
-    end
-
-    rule 'maybe_defbody : "{" bodydefs "}" |' do |db, _, df, _|
-      db.value = df.value.compact if df
+    rule 'maybe_defbody : "{" bodydefs "}"
+                        | "{" "}"
+                        |' do |db, _, df, _|
+      db.value = df.value.compact if df && df.type != '}'
     end
 
     rule 'bodydefs : bodydef
@@ -380,7 +372,7 @@ module Tablegen
     end
 
     rule 'value : id_anglevalues
-                | string
+                | string_concat
                 | NUMBER
                 | array
                 | dag
@@ -399,6 +391,17 @@ module Tablegen
                  | STRING STRING' do |s, s1, s2|
       s.value = s1.value
       s.value += s2.value if s2
+    end
+
+    rule 'string_concat : string "#" string_concat
+                        | ID "#" string_concat
+                        | string
+                        | ID' do |sc, lhs, _, rhs|
+      if rhs
+        sc.value = ([lhs.value] + [rhs.value]).flatten
+      else
+        sc.value = lhs.value
+      end
     end
 
     rule 'funccall : FUNCNAME maybe_cast "(" values ")"' do |fn, name, cast, _, args, _|
@@ -531,7 +534,7 @@ module Tablegen
             case @input[@pos]
             when '{'
               depth += 1
-            when '}'
+            when '}'    # }] actually
               depth -= 1
             when "\n"
               @lineno += 1
