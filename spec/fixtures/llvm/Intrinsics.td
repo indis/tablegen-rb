@@ -11,7 +11,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-include "spec/fixtures/llvm-valuetypes.td"
+include "llvm/CodeGen/ValueTypes.td"
 
 //===----------------------------------------------------------------------===//
 //  Properties we keep track of for intrinsics.
