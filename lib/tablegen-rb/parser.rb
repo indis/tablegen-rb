@@ -33,7 +33,7 @@ module Tablegen
 
     ignore " \t"
 
-    literals "<>{};=,:[]-()"
+    literals "<>{};=,:[]-().?"
 
     token(/\n+/) do |t|
       t.lexer.lineno += t.value.length
@@ -58,9 +58,18 @@ module Tablegen
     token :MULTICLASS, /multiclass\s/
 
     token :FUNCNAME, /![a-zA-Z_][a-zA-Z0-9_]*/
+    token :RID, /\$[a-zA-Z_][a-zA-Z0-9_]*/
     token :ID, /[a-zA-Z_][a-zA-Z0-9_]*/
     token :STRING, /"[^"]*"/
-    token :NUMBER, /[0-9]+/
+    token :BITNUMBER, /0b[0-9]+/ do |t|
+      t.value = t.value.to_i(2)
+      t.type = :NUMBER
+      t
+    end
+    token :NUMBER, /\-?[0-9]+/ do |t|
+      t.value = t.value.to_i
+      t
+    end
 
     def build_token(type, value)
       tok = super
@@ -100,6 +109,7 @@ module Tablegen
     end
 
     def pop_file
+      fn = @filename
       (@input, @pos, @filename, @lineno) = @inputstack.pop
     end
 
@@ -109,12 +119,14 @@ module Tablegen
   end
 
   class Parser < Rly::Yacc
+    # store_grammar 'rules.out'
+
     rule 'tabledef : definitions' do |tf, df|
       tf.value = df.value
     end
 
     rule 'definitions : definition
-                      | definition definitions' do |defs, df, other_defs|
+                      | definition definitions' do |defs, df, _, other_defs|
       defs.value = [df.value]
       defs.value += other_defs.value if other_defs
     end
@@ -123,12 +135,16 @@ module Tablegen
       df.value = clsdef.value
     end
 
-    rule 'definition : defdef' do |df, dfdef|
+    rule 'definition : defdef maybe_semicolon' do |df, dfdef|
       df.value = dfdef.value
     end
 
     rule 'definition : defmdef' do |df, dfmdef|
       df.value = dfmdef.value
+    end
+
+    rule 'definition : letvalueassign ";"' do |df, letdef|
+      df.value = letdef.value
     end
 
     rule 'definition : letdef' do |df, letdef|
@@ -140,7 +156,7 @@ module Tablegen
     end
 
     # classes
-    rule 'classdef : CLASS ID maybe_classdefargs maybe_superclasses maybe_classdefbody maybe_colon' do |cdef, _, name, args, sup, body, _|
+    rule 'classdef : CLASS ID maybe_classdefargs maybe_superclasses maybe_classdefbody maybe_semicolon' do |cdef, _, name, args, sup, body, _|
       cdef.value = {
         kind: :class,
         name: name.value,
@@ -192,7 +208,7 @@ module Tablegen
       end
     end
 
-    rule 'maybe_colon : ";" |' do ; end
+    rule 'maybe_semicolon : ";" |' do ; end
 
     rule 'classdefargs : typename_maybedef
                        | typename_maybedef "," classdefargs' do |args, tn, _, other_args|
@@ -201,12 +217,18 @@ module Tablegen
     end
 
     rule 'classdefbody : classfield
-                       | classfield classdefbody' do |body, f, other_fields|
-      body.value = [f.value]
-      body.value += other_fields.value if other_fields
+                       | classfield classdefbody
+                       |' do |body, f, other_fields|
+      if f
+        body.value = [f.value]
+        body.value += other_fields.value if other_fields
+      else
+        body.value = []
+      end
     end
 
-    rule 'classfield : typevalueassign ";"' do |f, va, _|
+    rule 'classfield : typevalueassign ";"
+                     | letvalueassign ";"' do |f, va, _|
       f.value = va.value
     end
 
@@ -220,11 +242,19 @@ module Tablegen
       }
     end
 
-    rule 'typevalueassign : type valueassign' do |tva, t, va|
-      tva.value = {
-        type: t.value,
+    rule 'letvalueassign : LET valueassign' do |lva, _, va|
+      lva.value = {
+        kind: :let,
         name: va.value[:name],
         value: va.value[:value],
+      }
+    end
+
+    rule 'typevalueassign : typename_maybedef' do |tva, t|
+      tva.value = {
+        type: t.value,
+        name: t.value[:name],
+        value: t.value[:value],
       }
     end
 
@@ -246,7 +276,8 @@ module Tablegen
     end
 
     rule 'type : ID
-               | ID "<" type ">"' do |ty, name, _, other_ty|
+               | ID "<" type ">"
+               | ID "<" NUMBER ">"' do |ty, name, _, other_ty|
       if other_ty
         ty.value = { name: name.value, sub: other_ty.value }
       else
@@ -266,7 +297,7 @@ module Tablegen
     end
 
     # defs
-    rule 'defdef : DEF ID ":" ID ";"' do |df, _, name, _, cname, _|
+    rule 'defdef : DEF ID maybe_superclasses maybe_defbody' do |df, _, name, cname, _|
       df.value = {
         kind: :def,
         name: name.value,
@@ -275,8 +306,8 @@ module Tablegen
       }
     end
 
-    rule 'defdef : DEF ID ":" ID "<" values ">" ";"
-                 | DEF ID ":" ID "<" values ">" "," values ";" ' do |df, _, name, _, cname, _, vals, _, _, randomval, _|
+    rule 'defdef : DEF ID maybe_superclasses "<" values ">" ";"
+                 | DEF ID maybe_superclasses "<" values ">" "," values ";"' do |df, _, name, cname, _, vals, _, _, randomval, _|
       df.value = {
         kind: :def,
         name: name.value,
@@ -287,18 +318,35 @@ module Tablegen
       df.value[:randomval] = randomval.value if randomval
     end
 
+    rule 'maybe_defbody : "{" definitions "}" |' do |db, _, df, _|
+      db.value = df.value if df
+    end
+
     rule 'values : value
                  | value "," values' do |vals, v, _, other_vals|
       vals.value = [v.value]
       vals.value += other_vals.value if other_vals
     end
 
-    rule 'value : ID
-                | id_anglevalues
+    rule 'maybe_values : values |' do |vals, v|
+      if v
+        vals.value = v.value
+      else
+        vals.value = []
+      end
+    end
+
+    rule 'value : id_anglevalues
                 | STRING
                 | NUMBER
                 | array
-                | funccall' do |v, the_v|
+                | dag
+                | funccall
+                | propvalue
+                | codeblock
+                | ID
+                | refvalue
+                | "?"' do |v, the_v|
       v.value = the_v.value
     end
 
@@ -307,6 +355,22 @@ module Tablegen
         kind: :func,
         name: name.value,
         args: args.value,
+      }
+    end
+
+    rule 'propvalue : ID "." value' do |pv, i, _, v|
+      pv.value = {
+        kind: :prop,
+        name: i.value,
+        value: v.value,
+      }
+    end
+
+    rule 'refvalue : ID ":" RID' do |pv, i, _, v|
+      pv.value = {
+        kind: :ref,
+        name: i.value,
+        value: v.value,
       }
     end
 
@@ -319,8 +383,18 @@ module Tablegen
       ar.value = vals ? vals.value : []
     end
 
-    rule 'letdef : LET valueassign IN definition
-                 | LET valueassign IN "{" definitions "}"' do |ld, _, va, _, defs1, defs2, _|
+    rule 'dag : "(" ID maybe_values ")"
+                 | "(" ")"' do |da, _, nm, vals|
+      da.value = vals ? vals.value : []
+      da.value.insert(0, nm)
+    end
+
+    rule 'codeblock : "{" "}"' do |cb, _, c, _|
+      cb.value = c.value
+    end
+
+    rule 'letdef : LET valueassigns IN definition
+                 | LET valueassigns IN "{" definitions "}"' do |ld, _, va, _, defs1, defs2, _|
       if defs1 == '='
         ld.value = {
           kind: :let,
@@ -336,22 +410,25 @@ module Tablegen
       end
     end
 
+    rule 'valueassigns : valueassign
+                       | valueassign "," valueassigns' do |vals, v, _, other_vals|
+      vals.value = [v.value]
+      vals.value += other_vals.value if other_vals
+    end
+
     on_error -> tok {
       puts "Error at #{tok.location_info}"
 
       syms = @symstack.dup.compact
       sh = syms.shift
       sh = syms.shift while sh.kind_of?(Rly::YaccSymbol)
+      syms.insert(0, sh)
       syms = syms.map do |s|
-        if s.kind_of?(Rly::LexToken)
-          s.inspect
-        else
-          s = s.inspect
-          s[0..30] + " ...>" if s.length > 30
-        end
+        "\t" + s.inspect
       end
 
-      puts "Stack: #{syms.join(', ')}  <-- #{tok.inspect}"
+      puts "Stack:  \n#{syms.join("\n")}\n\t^^^\n\t#{tok.inspect}"
+
       `subl #{tok.location_info[:filename]}:#{tok.location_info[:lineno]}:#{tok.location_info[:pos]}`
       raise RuntimeError
     }
