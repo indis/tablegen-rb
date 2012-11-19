@@ -8,10 +8,10 @@ def reload!
 end
 
 def run!(i, t=false)
-  l = Lexer.new()
+  l = Tablegen::Lexer.new()
   l.search_paths = ['spec/fixtures']
   l.push_file("#{i}.td")
-  p = Parser.new(l)
+  p = Tablegen::Parser.new(l)
   p.parse('', t)
 end
 
