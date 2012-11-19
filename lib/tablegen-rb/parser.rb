@@ -31,6 +31,8 @@ module Tablegen
       @lineno = 1
     end
 
+    metatokens :CODE
+
     ignore " \t"
 
     literals "<>{};=,:[]-().?"
@@ -42,6 +44,7 @@ module Tablegen
     end
 
     token(/\/\/[^\n]*/)
+    token(/\/\*[^\*]*\*\//)
 
     token(/include\s+"[^"]+"/) do |t|
       /include\s+"([^"]+)"/ =~ t.value
@@ -56,14 +59,28 @@ module Tablegen
     token :DEF, /def\s/
     token :DEFM, /defm\s/
     token :MULTICLASS, /multiclass\s/
+    token :FIELD, /field\s/
+
+    token :CODEOPEN, /\[\{/
+    token :CODECLOSE, /\}\]/
 
     token :FUNCNAME, /![a-zA-Z_][a-zA-Z0-9_]*/
     token :RID, /\$[a-zA-Z_][a-zA-Z0-9_]*/
     token :ID, /[a-zA-Z_][a-zA-Z0-9_]*/
     token :STRING, /"[^"]*"/
+    token :HEXNUMBER, /0x[0-9a-fA-F]+/ do |t|
+      t.value = t.value.to_i(16)
+      t.type = :NUMBER
+      t
+    end
     token :BITNUMBER, /0b[0-9]+/ do |t|
       t.value = t.value.to_i(2)
       t.type = :NUMBER
+      t
+    end
+    token :RANGE, /\d+\s*\-\s*\d+/ do |t|
+      r1,r2 = t.value.split('-')
+      t.value = r1..r2
       t
     end
     token :NUMBER, /\-?[0-9]+/ do |t|
@@ -169,7 +186,7 @@ module Tablegen
 
     rule 'maybe_classdefargs : "<" classdefargs ">" |' do |args, _, rargs, _|
       if rargs
-        args.value = rargs
+        args.value = rargs.value
       else
         args.value = []
       end
@@ -258,11 +275,18 @@ module Tablegen
       }
     end
 
-    rule 'valueassign : ID "=" value' do |va, n, _, v|
+    rule 'valueassign : ID maybe_range "=" value' do |va, n, mr, _, v|
       va.value = {
         name: n.value,
         value: v.value,
       }
+      va.value[:range] = mr.value if mr.value
+    end
+
+    rule 'maybe_range : "{" RANGE "}"
+                      | "{" NUMBER "}"
+                      |' do |mr, _, r, _|
+      mr.value = r.value if r
     end
 
     rule 'typename_maybedef : typename "=" value
@@ -271,8 +295,13 @@ module Tablegen
       tnd.value[:value] = val.value if val
     end
 
-    rule 'typename : type ID' do |tn, t, n|
+    rule 'typename : type ID
+                   | fieldstype ID' do |tn, t, n|
       tn.value = { type: t.value, name: n.value }
+    end
+
+    rule 'fieldstype : FIELD type' do |ft, _, t|
+      ft.value = t.value
     end
 
     rule 'type : ID
@@ -286,40 +315,54 @@ module Tablegen
     end
 
     # mdefs
-    rule 'defmdef : DEFM ID ":" ID "<" values ">" ";"' do |df, _, name, _, cname, _, vals, _, _|
+    rule 'defmdef : DEFM ID maybe_superclasses ";"' do |df, _, name, cname, _|
       df.value = {
         kind: :defm,
         name: name.value,
         classname: cname.value,
-        args: vals.value,
         def_at: name.location_info,
       }
     end
 
     # defs
-    rule 'defdef : DEF ID maybe_superclasses maybe_defbody' do |df, _, name, cname, _|
+    rule 'maybe_id : ID |' do |mid, i|
+      mid.value = i.value if i
+    end
+
+    rule 'defdef : DEF maybe_id maybe_superclasses maybe_defbody' do |df, td, name, cname, _|
       df.value = {
         kind: :def,
         name: name.value,
         classname: cname.value,
-        def_at: name.location_info,
+        def_at: td.location_info,
       }
     end
 
-    rule 'defdef : DEF ID maybe_superclasses "<" values ">" ";"
-                 | DEF ID maybe_superclasses "<" values ">" "," values ";"' do |df, _, name, cname, _, vals, _, _, randomval, _|
+    rule 'defdef : DEF maybe_id maybe_superclasses "<" values ">" ";"
+                 | DEF maybe_id maybe_superclasses "<" values ">" "," values ";"' do |df, td, name, cname, _, vals, _, _, randomval, _|
       df.value = {
         kind: :def,
         name: name.value,
         vals: vals.value,
         classname: cname.value,
-        def_at: name.location_info,
+        def_at: td.location_info,
       }
       df.value[:randomval] = randomval.value if randomval
     end
 
-    rule 'maybe_defbody : "{" definitions "}" |' do |db, _, df, _|
-      db.value = df.value if df
+    rule 'maybe_defbody : "{" bodydefs "}" |' do |db, _, df, _|
+      db.value = df.value.compact if df
+    end
+
+    rule 'bodydefs : bodydef
+                   | bodydef bodydefs' do |bdfs, d, _, other_bdfs|
+      bdfs.value = [d.value]
+      bdfs.value += other_bdfs.value if other_bdfs
+    end
+
+    rule 'bodydef : typevalueassign ";"
+                  | letvalueassign ";"' do |bd, d|
+      bd.value = d.value
     end
 
     rule 'values : value
@@ -337,25 +380,38 @@ module Tablegen
     end
 
     rule 'value : id_anglevalues
-                | STRING
+                | string
                 | NUMBER
                 | array
                 | dag
                 | funccall
                 | propvalue
+                | bitarray
                 | codeblock
-                | ID
+                | ID maybe_range
                 | refvalue
-                | "?"' do |v, the_v|
+                | "?"' do |v, the_v, maybe_range| # TODO: bitarry is broken by codeblock
       v.value = the_v.value
+      v.value = { val: v.value, range: maybe_range.value } if maybe_range
     end
 
-    rule 'funccall : FUNCNAME "(" values ")"' do |fn, name, _, args, _|
+    rule 'string : STRING
+                 | STRING STRING' do |s, s1, s2|
+      s.value = s1.value
+      s.value += s2.value if s2
+    end
+
+    rule 'funccall : FUNCNAME maybe_cast "(" values ")"' do |fn, name, cast, _, args, _|
       fn.value = {
         kind: :func,
         name: name.value,
         args: args.value,
       }
+      fn.value[:cast] = cast.value if cast.value
+    end
+
+    rule 'maybe_cast : "<" values ">" |' do |mc, _, val, _|
+      mc.value = val.value if val
     end
 
     rule 'propvalue : ID "." value' do |pv, i, _, v|
@@ -383,14 +439,32 @@ module Tablegen
       ar.value = vals ? vals.value : []
     end
 
-    rule 'dag : "(" ID maybe_values ")"
+    rule 'dag : "(" value maybe_values ")"
                  | "(" ")"' do |da, _, nm, vals|
       da.value = vals ? vals.value : []
       da.value.insert(0, nm)
     end
 
-    rule 'codeblock : "{" "}"' do |cb, _, c, _|
-      cb.value = c.value
+    rule 'bitarray : "{" bitvalues "}"
+                   | "{" "}"' do |ba, _, v, _|
+      ba.value = v ? v.value : []
+    end
+
+    rule 'bitvalues : bitvalue
+                    | bitvalue "," bitvalues' do |bv, v, _, other_bvs|
+      bv.value = [v.value]
+      bv.value += other_bvs.value if other_bvs
+    end
+
+    rule 'bitvalue : NUMBER
+                   | ID
+                   | "?"' do |bv, v|
+      bv.value = v.value
+    end
+
+    rule 'codeblock : CODEOPEN CODE CODECLOSE
+                    | CODEOPEN CODECLOSE' do |cb, _, c, _|
+      cb.value = c.value if c
     end
 
     rule 'letdef : LET valueassigns IN definition
@@ -416,7 +490,13 @@ module Tablegen
       vals.value += other_vals.value if other_vals
     end
 
-    on_error -> tok {
+    def errors_found
+      @errors_found ||= 0
+    end
+
+    attr_writer :errors_found
+
+    def error_log(tok, final=false)
       puts "Error at #{tok.location_info}"
 
       syms = @symstack.dup.compact
@@ -430,7 +510,46 @@ module Tablegen
       puts "Stack:  \n#{syms.join("\n")}\n\t^^^\n\t#{tok.inspect}"
 
       `subl #{tok.location_info[:filename]}:#{tok.location_info[:lineno]}:#{tok.location_info[:pos]}`
-      raise RuntimeError
-    }
+      raise RuntimeError if final
+    end
+
+    on_error -> tok do
+      prev_sym = @symstack[-1]
+      prev_st = @statestack[-1]
+      
+      if prev_sym.type == :CODEOPEN && @lr_table.lr_action[@statestack[-1]].keys == [:CODE, :CODECLOSE]
+        tok = @lex.instance_eval {
+          p = @pos
+
+          depth = 0
+          while true
+            @pos += 1
+            @linepos += 1
+
+            raise RuntimeError.new("End reached at #{@pos}?..") if @pos == @input.length
+
+            case @input[@pos]
+            when '{'
+              depth += 1
+            when '}'
+              depth -= 1
+            when "\n"
+              @lineno += 1
+            end
+
+            break if depth == -1
+          end
+
+          # puts "Lexer: skipping over '#{@input[p...@pos]}'"
+          build_token(:CODE, @input[p...@pos])
+        }
+
+        # tok = @lex.next
+        @errorok = true
+        return tok
+      else
+        error_log(tok, true)
+      end
+    end
   end
 end
